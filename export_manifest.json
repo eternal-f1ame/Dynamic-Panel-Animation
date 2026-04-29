@@ -1,0 +1,65 @@
+{
+  "source_tree": "DiffSynth",
+  "export_layout": {
+    "project_package": "src/native_animation",
+    "vendored_runtime": "src/diffsynth",
+    "cluster_scripts": "scripts/slurm"
+  },
+  "python_modules": [
+    {
+      "source": "course_project/flowmatch_i2v/build_sakuga_csv.py",
+      "destination": "src/native_animation/data/build_metadata.py"
+    },
+    {
+      "source": "course_project/flowmatch_i2v/extract_keyframes.py",
+      "destination": "src/native_animation/data/extract_keyframes.py"
+    },
+    {
+      "source": "course_project/flowmatch_i2v/sample_utils.py",
+      "destination": "src/native_animation/data/sampling.py"
+    },
+    {
+      "source": "course_project/flowmatch_i2v/native_animation_flowmatch.py",
+      "destination": "src/native_animation/modeling/native_flowmatch.py"
+    },
+    {
+      "source": "course_project/flowmatch_i2v/run_base_inference_demo.py",
+      "destination": "src/native_animation/inference/run_baseline.py"
+    },
+    {
+      "source": "course_project/flowmatch_i2v/infer_native_animation.py",
+      "destination": "src/native_animation/inference/generate.py"
+    },
+    {
+      "source": "course_project/flowmatch_i2v/train_native_animation.py",
+      "destination": "src/native_animation/training/train.py"
+    },
+    {
+      "source": "course_project/native_animation_submission/evaluate_native_animation.py",
+      "destination": "src/native_animation/evaluation/evaluate.py"
+    }
+  ],
+  "copied_paths": [
+    "src/diffsynth",
+    "LICENSE"
+  ],
+  "generated_files": [
+    "src/native_animation/__init__.py",
+    "src/native_animation/data/__init__.py",
+    "src/native_animation/inference/__init__.py",
+    "src/native_animation/training/__init__.py",
+    "src/native_animation/evaluation/__init__.py",
+    "src/native_animation/modeling/__init__.py",
+    "README.md",
+    "docs/method.md",
+    "THIRD_PARTY.md",
+    ".gitignore",
+    "pyproject.toml",
+    "scripts/train_native_animation.sh",
+    "scripts/slurm/build_metadata.sbatch",
+    "scripts/slurm/env_smoke_test.sbatch",
+    "scripts/slurm/base_inference_demo.sbatch",
+    "scripts/slurm/train_native_animation.sbatch"
+  ],
+  "excluded_examples_docs_models_logs_outputs_data": true
+}

@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "native-animation-flowmatching"
+version = "0.1.0"
+description = "Standalone native-animation keyframe-to-video project."
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+dependencies = [
+    "accelerate",
+    "datasets",
+    "einops",
+    "ftfy",
+    "imageio[ffmpeg]",
+    "matplotlib",
+    "modelscope",
+    "numpy",
+    "open-clip-torch",
+    "opencv-python-headless",
+    "pandas",
+    "peft",
+    "Pillow",
+    "protobuf",
+    "safetensors",
+    "sentencepiece",
+    "torch>=2.0.0",
+    "torchvision",
+    "transformers",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+
+[project.scripts]
+native-animation-build-metadata = "native_animation.data.build_metadata:main"
+native-animation-extract-keyframes = "native_animation.data.extract_keyframes:main"
+native-animation-run-baseline = "native_animation.inference.run_baseline:main"
+native-animation-generate = "native_animation.inference.generate:main"
+native-animation-train = "native_animation.training.train:main"
+native-animation-evaluate = "native_animation.evaluation.evaluate:main"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["native_animation", "native_animation.*", "diffsynth", "diffsynth.*"]
+
+[tool.setuptools]
+include-package-data = true
