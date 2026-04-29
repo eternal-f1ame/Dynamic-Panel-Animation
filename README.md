@@ -19,7 +19,7 @@ Concretely, the project focuses on:
 
 The main team-owned work in this repository lives under `src/native_animation/`.
 
-The contribution is not just one loss file. It includes:
+The contribution includes:
 
 - dataset collection and curation
   - sourcing native-animation clips from Sakugabooru for the project dataset
