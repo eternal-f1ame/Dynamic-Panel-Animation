@@ -1,4 +1,4 @@
-# Native Animation Flow Matching
+# Dynamic Panel Animation
 
 Standalone repository for keyframe-conditioned native-animation video generation.
 
