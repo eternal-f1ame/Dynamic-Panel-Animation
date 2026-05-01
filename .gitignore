@@ -21,3 +21,10 @@ wandb/
 *.pth
 *.safetensors
 *.bin
+
+# LaTeX build artifacts
+Final_Project_Report/main.aux
+Final_Project_Report/main.bbl
+Final_Project_Report/main.blg
+Final_Project_Report/main.log
+Final_Project_Report/main.out
