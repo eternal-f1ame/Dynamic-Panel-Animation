@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Minimal native-animation Flow Matching training entrypoint."""
+"""Minimal native-animation Flow Matching training entrypoint.
+
+Wraps DiffSynth's training infrastructure: builds a Wan video pipeline,
+swaps in the project scheduler, and routes the SFT path through
+``NativeAnimationFlowMatchLoss`` so the motion-aware + delta-consistency
+loss replaces the stock velocity loss.
+"""
 
 from __future__ import annotations
 
@@ -32,10 +38,13 @@ from native_animation.modeling.native_flowmatch import (
     NativeAnimationFlowMatchScheduler,
 )
 
+# Quiet HuggingFace's tokenizer-parallelism warning under multi-process accelerate.
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 class NativeAnimationWanTrainingModule(DiffusionTrainingModule):
+    """DiffSynth training module wired to the native-animation FM loss."""
+
     def __init__(
         self,
         model_paths=None,
@@ -63,6 +72,8 @@ class NativeAnimationWanTrainingModule(DiffusionTrainingModule):
         delta_loss_weight=0.25,
     ):
         super().__init__()
+        # Force gradient checkpointing on: video Flow Matching activations are
+        # large enough that disabling it almost always OOMs on the cluster.
         if not use_gradient_checkpointing:
             warnings.warn(
                 "Gradient checkpointing is disabled. Enabling it to reduce the chance of running out of memory."
@@ -89,9 +100,11 @@ class NativeAnimationWanTrainingModule(DiffusionTrainingModule):
             tokenizer_config=tokenizer_config,
             audio_processor_config=audio_processor_config,
         )
+        # Replace Wan's stock scheduler with the project's keyframe-preserving variant.
         self.pipe.scheduler = NativeAnimationFlowMatchScheduler(shift=native_scheduler_shift)
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
 
+        # Toggle the requested submodules between train/eval and attach LoRAs.
         self.switch_pipe_to_training_mode(
             self.pipe,
             trainable_models,
@@ -112,6 +125,9 @@ class NativeAnimationWanTrainingModule(DiffusionTrainingModule):
         self.min_timestep_boundary = min_timestep_boundary
         self.motion_weighting_scale = motion_weighting_scale
         self.delta_loss_weight = delta_loss_weight
+        # Maps DiffSynth task names to the appropriate loss callable. The
+        # ``data_process`` variants short-circuit (return inputs unchanged) so
+        # the launcher can preprocess data without computing a loss.
         self.task_to_loss = {
             "sft:data_process": lambda pipe, *args: args,
             "direct_distill:data_process": lambda pipe, *args: args,
@@ -136,6 +152,7 @@ class NativeAnimationWanTrainingModule(DiffusionTrainingModule):
         return torch.bfloat16
 
     def compute_sft_loss(self, pipe, inputs_shared, inputs_posi, inputs_nega):
+        """SFT loss: invoke the project's native-animation Flow Matching loss."""
         return NativeAnimationFlowMatchLoss(
             pipe,
             motion_weighting_scale=self.motion_weighting_scale,
@@ -145,6 +162,12 @@ class NativeAnimationWanTrainingModule(DiffusionTrainingModule):
         )
 
     def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
+        """Materialize optional conditioning fields (keyframe, end image, etc).
+
+        The keyframe-conditioned setup populates ``input_image`` from the
+        first decoded video frame; other branches are kept for compatibility
+        with adjacent DiffSynth tasks (audio, VACE references, ...).
+        """
         for extra_input in extra_inputs:
             if extra_input == "input_image":
                 inputs_shared["input_image"] = data["video"][0]
@@ -154,11 +177,14 @@ class NativeAnimationWanTrainingModule(DiffusionTrainingModule):
                 inputs_shared[extra_input] = data[extra_input][0]
             else:
                 inputs_shared[extra_input] = data[extra_input]
+        # WanToDance variant: it decodes one latent slice per chunk of 4 frames,
+        # so reconstruct the implied frame count for the pipeline.
         if inputs_shared.get("framewise_decoding", False):
             inputs_shared["num_frames"] = 4 * (len(data["video"]) - 1) + 1
         return inputs_shared
 
     def get_pipeline_inputs(self, data):
+        """Pack a dataset sample into the (shared, positive, negative) input triple."""
         inputs_posi = {"prompt": data["prompt"]}
         inputs_nega = {}
         inputs_shared = {
@@ -166,6 +192,7 @@ class NativeAnimationWanTrainingModule(DiffusionTrainingModule):
             "height": data["video"][0].size[1],
             "width": data["video"][0].size[0],
             "num_frames": len(data["video"]),
+            # CFG is disabled during training; only the conditional path is run.
             "cfg_scale": 1,
             "tiled": False,
             "rand_device": self.pipe.device,
@@ -180,9 +207,12 @@ class NativeAnimationWanTrainingModule(DiffusionTrainingModule):
         return inputs_shared, inputs_posi, inputs_nega
 
     def forward(self, data, inputs=None):
+        """Standard DiffSynth forward: run pipeline units, then dispatch the loss."""
         if inputs is None:
             inputs = self.get_pipeline_inputs(data)
         inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
+        # Each unit (text encode, VAE encode, ...) transforms the input tuple
+        # in place before the loss head consumes the final latents.
         for unit in self.pipe.units:
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
         return self.task_to_loss[self.task](self.pipe, *inputs)
@@ -254,6 +284,9 @@ def main():
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
     )
 
+    # Build the video dataset. Resolutions are forced to multiples of 16 to
+    # match the VAE's spatial stride, and the temporal stride (4 vs 1) tracks
+    # whether the model uses framewise decoding.
     dataset = UnifiedDataset(
         base_path=args.dataset_base_path,
         metadata_path=args.dataset_metadata_path,
@@ -270,6 +303,8 @@ def main():
             time_division_factor=4 if not args.framewise_decoding else 1,
             time_division_remainder=1 if not args.framewise_decoding else 0,
         ),
+        # Per-key operator overrides for non-default fields (face video crop,
+        # 16 kHz audio loading, raw music paths). Unused outside their tasks.
         special_operator_map={
             "animate_face_video": ToAbsolutePath(args.dataset_base_path)
             >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
@@ -308,6 +343,8 @@ def main():
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
     )
+    # ``data_process`` tasks pre-cache encoded latents/embeddings; ``train``
+    # tasks run the actual gradient loop. Same module, different launcher.
     launcher_map = {
         "sft:data_process": launch_data_process_task,
         "direct_distill:data_process": launch_data_process_task,

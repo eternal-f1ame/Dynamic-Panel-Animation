@@ -15,6 +15,16 @@ Concretely, the project focuses on:
 - comparing baseline generations against a project-owned native-animation Flow Matching variant
 - evaluating results with a repeatable headless scoring workflow
 
+## Method Overview
+
+The project-owned method extends Wan's Flow Matching backbone with three small but targeted changes, all implemented in `src/native_animation/modeling/native_flowmatch.py`:
+
+1. **Keyframe-preserving scheduler shift.** The custom `NativeAnimationFlowMatchScheduler` defaults to `shift=3.0` (vs. Wan's heavier default), so early timesteps stay closer to the clean signal and the conditioning keyframe survives noising.
+2. **Motion-aware frame weighting.** During training, per-frame loss weights are derived from the magnitude of frame-to-frame latent differences. Active frames carry more weight than long static stretches, which dominate the Sakuga clip distribution.
+3. **Latent temporal-difference consistency.** On top of the standard velocity loss, the predicted clean sequence is regressed onto the ground-truth frame-to-frame latent deltas. This penalizes flicker and mid-clip collapse that velocity-only loss tends to ignore.
+
+The keyframe latents are clamped clean during noising and excluded from the loss so the anchor stays pinned, and the evaluator (`src/native_animation/evaluation/evaluate.py`) summarizes generations with four CLIP+flow-derived metrics (CFS, TCS, WorstSegment, DFS). See `docs/method.md` for the longer write-up.
+
 ## Team Contributions
 
 The main team-owned work in this repository lives under `src/native_animation/`.
@@ -46,7 +56,7 @@ The contribution includes:
 ## Repository Layout
 
 - `src/native_animation/`
-  - project-owned code
+  - project-owned code, documented inline with succinct comments that explain the non-obvious decisions (scheduler shift, motion weighting, delta-consistency loss, anchor-frame handling, evaluation metrics)
   - `data/` metadata building, sampling, and keyframe extraction
   - `modeling/` custom Flow Matching scheduler and loss
   - `training/` fine-tuning entrypoint

@@ -19,6 +19,8 @@ from diffsynth.utils.data import save_video
 from native_animation.modeling.native_flowmatch import NativeAnimationFlowMatchScheduler
 
 
+# Each preset lists every weight file the corresponding Wan backbone needs.
+# Add a preset here to make it selectable from the CLI.
 MODEL_PRESETS = {
     "wan21_i2v_14b_480p": [
         ModelConfig(model_id="Wan-AI/Wan2.1-I2V-14B-480P", origin_file_pattern="diffusion_pytorch_model*.safetensors"),
@@ -65,8 +67,10 @@ def main() -> None:
         device=device,
         model_configs=MODEL_PRESETS[args.model_preset],
     )
+    # Swap in the project's keyframe-preserving scheduler.
     pipe.scheduler = NativeAnimationFlowMatchScheduler(shift=args.native_scheduler_shift)
 
+    # Optionally apply a fine-tuned LoRA on top of the base DiT weights.
     if args.lora_path is not None:
         pipe.load_lora(pipe.dit, args.lora_path, alpha=1.0)
 

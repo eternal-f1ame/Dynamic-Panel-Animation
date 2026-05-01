@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""Headless evaluation for native-animation video generation outputs."""
+"""Headless evaluation for native-animation video generation outputs.
+
+For each (ground-truth, generated) pair we sample frames, score per-frame
+fidelity with CLIP cosine similarity (penalized by optical-flow disagreement),
+and aggregate into four headline metrics:
+
+- ``CFS``: continuation fidelity = mean per-frame score
+- ``TCS``: temporal consistency = mean - std (high mean, low jitter)
+- ``WorstSegment``: worst-case windowed score (catches localized failures)
+- ``DFS``: diffusion-failure score (mid-clip dip + high frame-to-frame jitter)
+
+The final score combines these with hand-tuned weights. The script can be
+fed by a generation summary JSON, a directory of paired mp4 files, or an
+explicit single pair.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +28,8 @@ import numpy as np
 import torch
 from PIL import Image
 
+# CLIP backends are loaded lazily; either OpenAI's reference repo or the
+# open_clip drop-in is acceptable, picked by whichever import succeeds.
 try:
     import clip as openai_clip
 except ImportError:
@@ -25,6 +41,8 @@ except ImportError:
     open_clip = None
 
 
+# Matches our Sakuga clip naming convention (e.g. ``clip_42_3``) to pair
+# ground-truth clips with their generated counterpart in directory mode.
 PAIR_KEY_RE = re.compile(r"(clip_\d+_\d+)")
 
 
@@ -46,6 +64,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def sample_frames(video_path: Path, num_frames: int) -> list[np.ndarray]:
+    """Sample ``num_frames`` evenly spaced BGR frames from ``video_path``."""
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         return []
@@ -69,6 +88,7 @@ def sample_frames(video_path: Path, num_frames: int) -> list[np.ndarray]:
 
 
 def resize_pair(gt_frames: list[np.ndarray], gen_frames: list[np.ndarray]) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Bring both clips to the smaller of their resolutions for fair comparison."""
     target_width = min(gt_frames[0].shape[1], gen_frames[0].shape[1])
     target_height = min(gt_frames[0].shape[0], gen_frames[0].shape[0])
     target_size = (target_width, target_height)
@@ -80,6 +100,7 @@ def resize_pair(gt_frames: list[np.ndarray], gen_frames: list[np.ndarray]) -> tu
 
 @lru_cache(maxsize=1)
 def load_clip_backbone() -> tuple[str, object, object, str]:
+    """Load CLIP once and cache it for the life of the process."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if openai_clip is not None:
         model, preprocess = openai_clip.load("ViT-B/32", device=device)
@@ -93,20 +114,24 @@ def load_clip_backbone() -> tuple[str, object, object, str]:
 
 
 def clip_feature(frame: np.ndarray) -> np.ndarray:
+    """Encode a single BGR frame to an L2-normalized CLIP image embedding."""
     backend_name, model, preprocess, device = load_clip_backbone()
     image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     input_tensor = preprocess(image).unsqueeze(0).to(device)
     with torch.no_grad():
         feature = model.encode_image(input_tensor)
+    # L2 normalize so dot product == cosine similarity.
     feature = feature / feature.norm(dim=-1, keepdim=True).clamp(min=1e-6)
     return feature.detach().cpu().numpy()[0].astype(np.float32)
 
 
 def extract_features(frames: list[np.ndarray]) -> list[np.ndarray]:
+    """Encode every frame in a list to a CLIP feature vector."""
     return [clip_feature(frame) for frame in frames]
 
 
 def cosine_similarity(lhs: np.ndarray, rhs: np.ndarray) -> float:
+    """Cosine similarity for already-L2-normalized vectors."""
     return float(np.dot(lhs, rhs))
 
 
@@ -115,14 +140,24 @@ def compute_frame_scores(
     gen_frames: list[np.ndarray],
     window: int,
 ) -> np.ndarray:
+    """Per-frame fidelity score combining CLIP similarity and flow agreement.
+
+    For each ground-truth frame we search a +/- ``window`` neighborhood of
+    generated frames for the best CLIP cosine match (this absorbs small
+    timing offsets between the two clips). We then penalize that score by
+    the optical-flow disagreement between the two frame pairs so a static
+    generation can't game CLIP similarity.
+    """
     gt_features = extract_features(gt_frames)
     gen_features = extract_features(gen_frames)
     scores = []
 
     for frame_idx in range(len(gt_frames) - 1):
+        # Local search range around the GT frame's index in the generated clip.
         gen_start = max(0, frame_idx - window)
         gen_end = min(len(gen_features), frame_idx + window + 1)
 
+        # Pick the most similar generated frame within the window.
         best_similarity = -1.0
         best_gen_idx = gen_start
         for gen_idx in range(gen_start, gen_end):
@@ -131,6 +166,8 @@ def compute_frame_scores(
                 best_similarity = similarity
                 best_gen_idx = gen_idx
 
+        # Optical flow on grayscale is enough; we only care about motion
+        # magnitude, not color-space details.
         gt_prev = cv2.cvtColor(gt_frames[frame_idx], cv2.COLOR_BGR2GRAY)
         gt_next = cv2.cvtColor(gt_frames[frame_idx + 1], cv2.COLOR_BGR2GRAY)
         gen_prev = cv2.cvtColor(gen_frames[best_gen_idx], cv2.COLOR_BGR2GRAY)
@@ -142,6 +179,7 @@ def compute_frame_scores(
         flow_gt = cv2.calcOpticalFlowFarneback(gt_prev, gt_next, None, 0.5, 3, 15, 3, 5, 1.2, 0)
         flow_gen = cv2.calcOpticalFlowFarneback(gen_prev, gen_next, None, 0.5, 3, 15, 3, 5, 1.2, 0)
         flow_diff = np.mean(np.abs(flow_gt - flow_gen))
+        # Squash to [0, 1) so the penalty stays bounded regardless of magnitude.
         flow_norm = np.tanh(flow_diff / 10.0)
 
         scores.append(best_similarity - 0.5 * float(flow_norm))
@@ -150,6 +188,7 @@ def compute_frame_scores(
 
 
 def normalize_scores(scores: np.ndarray, num_points: int) -> np.ndarray:
+    """Resample the score curve to a fixed length so plots/aggregates align."""
     if len(scores) == 0:
         return scores
     if len(scores) == 1:
@@ -160,6 +199,13 @@ def normalize_scores(scores: np.ndarray, num_points: int) -> np.ndarray:
 
 
 def diffusion_failure_score(scores: np.ndarray) -> tuple[float, float, float, float, float, float]:
+    """Detect the classic mid-clip diffusion-collapse signature.
+
+    Splits the curve into thirds: failures usually show a healthy start/end
+    but a slumped middle, plus high frame-to-frame jitter. DFS combines a
+    mid-drop term (70%) with a smoothness term (30%), each clipped against
+    an empirically tuned 0.08 cutoff so DFS lives in [0, 1].
+    """
     if len(scores) < 3:
         average = float(np.mean(scores)) if len(scores) else 0.0
         return 0.0, 0.0, 0.0, average, average, average
@@ -177,10 +223,12 @@ def diffusion_failure_score(scores: np.ndarray) -> tuple[float, float, float, fl
 
 
 def temporal_consistency(scores: np.ndarray) -> float:
+    """Reward high mean and low jitter together (mean - std)."""
     return float(np.mean(scores) - np.std(scores))
 
 
 def worst_segment(scores: np.ndarray, window: int = 5) -> float:
+    """Min over rolling windows so a localized failure isn't averaged away."""
     if len(scores) == 0:
         return 0.0
     window = min(window, len(scores))
@@ -188,19 +236,23 @@ def worst_segment(scores: np.ndarray, window: int = 5) -> float:
 
 
 def continuation_fidelity(scores: np.ndarray) -> float:
+    """Plain mean per-frame score across the clip."""
     return float(np.mean(scores)) if len(scores) else 0.0
 
 
 def final_score(cfs: float, tcs: float, worst: float, dfs: float) -> float:
+    """Headline score: weighted positives minus a strong DFS penalty."""
     return float(0.4 * cfs + 0.25 * tcs + 0.2 * worst - 0.5 * dfs)
 
 
 def classify_result(result: dict) -> str:
+    """Translate the four metrics into a human-readable verdict bucket."""
     cfs = result["CFS"]
     tcs = result["TCS"]
     worst = result["WorstSegment"]
     dfs = result["DFS"]
 
+    # Thresholds were calibrated by eye against labeled good / bad clips.
     if cfs > 0.93 and tcs > 0.90 and worst > 0.90 and dfs < 0.10:
         return "[OK] Good continuation"
     if dfs > 0.7:
@@ -217,11 +269,13 @@ def classify_result(result: dict) -> str:
 
 
 def slugify(name: str) -> str:
+    """Make ``name`` filesystem-safe for plot output paths."""
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name.strip())
     return safe[:120] if safe else "result"
 
 
 def save_plot(scores: np.ndarray, output_path: Path) -> None:
+    """Save the per-frame score curve as a PNG (Agg backend, no display needed)."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -247,11 +301,13 @@ def evaluate_pair(
     window: int,
     normalized_points: int,
 ) -> dict:
+    """Score a single (ground-truth, generated) clip pair end to end."""
     gt_frames = sample_frames(ground_truth_path, num_frames=num_frames)
     gen_frames = sample_frames(generated_path, num_frames=num_frames)
     if len(gt_frames) < 2 or len(gen_frames) < 2:
         return {"error": "Frame extraction failed or returned too few frames."}
 
+    # Truncate to a common length and resolution before scoring.
     usable_frames = min(len(gt_frames), len(gen_frames))
     gt_frames, gen_frames = gt_frames[:usable_frames], gen_frames[:usable_frames]
     gt_frames, gen_frames = resize_pair(gt_frames, gen_frames)
@@ -283,10 +339,12 @@ def evaluate_pair(
 
 
 def load_pairs_from_summary(summary_path: Path, dataset_base_path: Path | None) -> list[tuple[str, Path, Path]]:
+    """Load pairs from a generation script's ``summary.json`` output."""
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     pairs = []
     for item in summary:
         source_video = Path(item["video"])
+        # Summaries usually carry relative source paths -- resolve against dataset root.
         if not source_video.is_absolute():
             if dataset_base_path is None:
                 raise SystemExit(
@@ -300,11 +358,18 @@ def load_pairs_from_summary(summary_path: Path, dataset_base_path: Path | None) 
 
 
 def extract_pair_key(filename: str) -> str | None:
+    """Pull the ``clip_<series>_<index>`` token out of a filename, if present."""
     match = PAIR_KEY_RE.search(filename)
     return match.group(1) if match else None
 
 
 def load_pairs_from_directory(folder: Path) -> list[tuple[str, Path, Path]]:
+    """Pair ``clip_*.mp4`` ground-truth files with their generated counterparts.
+
+    Filenames that start with ``clip_`` are treated as ground truth; everything
+    else sharing the same ``clip_<a>_<b>`` key counts as a generated variant
+    (so multiple generations against one source are all evaluated).
+    """
     ground_truth = {}
     generated = {}
     for file_path in sorted(folder.iterdir()):
@@ -326,6 +391,7 @@ def load_pairs_from_directory(folder: Path) -> list[tuple[str, Path, Path]]:
 
 
 def summarize_results(results: list[dict]) -> dict:
+    """Aggregate per-pair metrics into a single run-level summary."""
     if not results:
         return {"num_results": 0}
     return {
@@ -338,6 +404,7 @@ def summarize_results(results: list[dict]) -> dict:
 
 
 def resolve_pairs(args: argparse.Namespace) -> list[tuple[str, Path, Path]]:
+    """Dispatch to the right pair loader based on which CLI source was given."""
     if args.summary_json is not None:
         return load_pairs_from_summary(args.summary_json.resolve(), args.dataset_base_path.resolve() if args.dataset_base_path else None)
     if args.pairs_dir is not None:

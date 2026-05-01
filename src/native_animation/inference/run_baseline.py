@@ -50,8 +50,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_pipe(low_vram: bool) -> WanVideoPipeline:
+    """Construct a vanilla Wan2.2 TI2V-5B pipeline for the baseline comparison.
+
+    When ``low_vram`` is set we use DiffSynth's disk-offload config so the
+    pipeline fits on a single small GPU at the cost of throughput.
+    """
     model_configs = []
     if low_vram:
+        # Stream weights from disk -> CPU -> GPU on demand.
         vram_config = {
             "offload_dtype": "disk",
             "offload_device": "disk",
@@ -65,6 +71,8 @@ def build_pipe(low_vram: bool) -> WanVideoPipeline:
     else:
         vram_config = {}
 
+    # Wan ships the text encoder, DiT weights, and VAE under separate file
+    # patterns; load all three from the same model id.
     for pattern in (
         "models_t5_umt5-xxl-enc-bf16.pth",
         "diffusion_pytorch_model*.safetensors",
@@ -82,12 +90,14 @@ def build_pipe(low_vram: bool) -> WanVideoPipeline:
         "torch_dtype": torch.bfloat16,
         "device": "cuda",
         "model_configs": model_configs,
+        # The 5B checkpoint reuses the umt5 tokenizer published with the 1.3B model.
         "tokenizer_config": ModelConfig(
             model_id="Wan-AI/Wan2.1-T2V-1.3B",
             origin_file_pattern="google/umt5-xxl/",
         ),
     }
     if low_vram:
+        # Reserve ~2 GB of headroom for activations.
         kwargs["vram_limit"] = torch.cuda.mem_get_info("cuda")[1] / (1024 ** 3) - 2
 
     return WanVideoPipeline.from_pretrained(**kwargs)
@@ -123,8 +133,10 @@ def main() -> None:
         keyframe_path = keyframe_dir / f"{row_index:05d}_{file_stem}.png"
         output_video_path = generated_dir / f"{row_index:05d}_{file_stem}.mp4"
         prompt = row["prompt"]
+        # Vary the seed across rows so different clips don't share noise.
         seed = args.seed_base + order
 
+        # Pull the first frame from the source clip and feed it as the I2V keyframe.
         extract_first_frame(video_path, keyframe_path, resize=(args.width, args.height))
         input_image = Image.open(keyframe_path).convert("RGB")
 
@@ -158,9 +170,12 @@ def main() -> None:
                 "seed": seed,
             }
         )
+        # Free fragmented allocations between clips so long demo runs don't OOM.
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    # ``summary.json`` is what the evaluator consumes to pair generated videos
+    # against their source clips.
     summary_path = output_dir / "summary.json"
     with summary_path.open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
